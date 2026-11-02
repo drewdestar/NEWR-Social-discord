@@ -1,13 +1,19 @@
-"""Counting game — slash setup command + a passive message listener.
+"""Counting game — slash setup/status commands + a passive message listener.
 
   /count_setup <channel> — staff-only: set the counting channel.
+  /count — anyone: show the next expected number and current streak.
 
 The listener (on_message) is NOT a command: it runs automatically in
 the background for messages in the configured counting channel.
-  * Only the exact next number counts: expected number + streak are
-    tracked in the DB (counting_state). A correct number advances both.
-  * A wrong NUMBER gets a gentle reset message (streak resets,
-    expected goes back to 1). User messages are never deleted.
+  * Only the exact next number counts: expected number + streak +
+    last counter are tracked in the DB (counting_state). A correct
+    number advances expected and streak and records its author.
+  * The same user may NOT count twice in a row: a repeat count is
+    ignored (not counted, no state change) and gets a gentle visible
+    notice in the channel. User messages are never deleted.
+  * A wrong NUMBER (from a different user than the last counter)
+    gets a gentle reset message (streak resets, expected goes back
+    to 1, last counter cleared). User messages are never deleted.
   * Non-numeric messages are ignored (chat in the channel does not
     break the count).
   * Bot messages are ignored.
@@ -19,6 +25,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+import ui
 from staff import require_staff
 
 
@@ -32,8 +39,7 @@ class Counting(commands.Cog):
                           channel: discord.TextChannel) -> None:
         try:
             if interaction.guild is None:
-                await interaction.response.send_message(
-                    "This command only works inside a server.", ephemeral=True)
+                await interaction.response.send_message(embed=ui.err("Server only", "This command only works inside a server."), ephemeral=True)
                 return
             if not await require_staff(interaction):
                 return
@@ -43,13 +49,50 @@ class Counting(commands.Cog):
                     "INSERT OR IGNORE INTO counting_state (guild_id, expected, streak) "
                     "VALUES (?, 1, 0)", (interaction.guild.id,))
             await interaction.response.send_message(
-                f"Counting channel set to {channel.mention}. "
-                f"The count starts at 1.", ephemeral=True)
+                embed=ui.ok("Counting channel set",
+                            f"Counting channel set to {channel.mention}. "
+                            f"The count starts at 1."), ephemeral=True)
         except Exception:
             try:
                 if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "Something went wrong. Please try again later.", ephemeral=True)
+                    await interaction.response.send_message(embed=ui.err("Something went wrong", "Something went wrong. Please try again later."), ephemeral=True)
+            except Exception:
+                pass
+
+    @app_commands.command(name="count", description="Show the current counting game status.")
+    async def count(self, interaction: discord.Interaction) -> None:
+        try:
+            if interaction.guild is None:
+                await interaction.response.send_message(embed=ui.err("Server only", "This command only works inside a server."), ephemeral=True)
+                return
+            counting_id = db.get_int_setting(interaction.guild.id, "counting_channel")
+            if counting_id is None:
+                await interaction.response.send_message(
+                    embed=ui.err("No counting channel",
+                                 "No counting channel has been set yet. Ask staff to run "
+                                 "/count_setup first."), ephemeral=True)
+                return
+            with db._conn() as conn:
+                row = conn.execute(
+                    "SELECT expected, streak, last_counter FROM counting_state "
+                    "WHERE guild_id=?", (interaction.guild.id,)).fetchone()
+            expected = row["expected"] if row else 1
+            streak = row["streak"] if row else 0
+            current = expected - 1 if streak > 0 else 0
+            last = row["last_counter"] if row else None
+            last_text = f"<@{last}>" if last else "nobody yet"
+            await interaction.response.send_message(
+                embed=ui.make("🔢 Counting status", "Current counting game status.",
+                              ui.BLURPLE,
+                              fields=[("Current number", str(current), True),
+                                      ("Next number", str(expected), True),
+                                      ("Current streak", str(streak), True),
+                                      ("Last counted by", last_text, False)]),
+                ephemeral=True)
+        except Exception:
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(embed=ui.err("Something went wrong", "Something went wrong. Please try again later."), ephemeral=True)
             except Exception:
                 pass
 
@@ -75,27 +118,44 @@ class Counting(commands.Cog):
                 return
             with db._conn() as conn:
                 row = conn.execute(
-                    "SELECT expected, streak FROM counting_state WHERE guild_id=?",
-                    (message.guild.id,)).fetchone()
+                    "SELECT expected, streak, last_counter FROM counting_state "
+                    "WHERE guild_id=?", (message.guild.id,)).fetchone()
                 expected = row["expected"] if row else 1
                 streak = row["streak"] if row else 0
-                if number == expected:
+                last_counter = row["last_counter"] if row else None
+                if last_counter is not None and last_counter == message.author.id:
+                    # Repeat count: ignored, no state change at all.
+                    pass
+                elif number == expected:
                     conn.execute(
-                        "INSERT INTO counting_state VALUES (?, ?, ?) "
+                        "INSERT INTO counting_state "
+                        "(guild_id, expected, streak, last_counter) VALUES (?, ?, ?, ?) "
                         "ON CONFLICT(guild_id) DO UPDATE SET expected=excluded.expected, "
-                        "streak=excluded.streak",
-                        (message.guild.id, expected + 1, streak + 1))
+                        "streak=excluded.streak, last_counter=excluded.last_counter",
+                        (message.guild.id, expected + 1, streak + 1, message.author.id))
                 else:
                     conn.execute(
-                        "INSERT INTO counting_state VALUES (?, 1, 0) "
-                        "ON CONFLICT(guild_id) DO UPDATE SET expected=1, streak=0",
+                        "INSERT INTO counting_state "
+                        "(guild_id, expected, streak, last_counter) VALUES (?, 1, 0, NULL) "
+                        "ON CONFLICT(guild_id) DO UPDATE SET expected=1, streak=0, "
+                        "last_counter=NULL",
                         (message.guild.id,))
-            if number != expected:
+            if last_counter is not None and last_counter == message.author.id:
                 try:
                     await message.channel.send(
-                        f"Oops! {number} breaks the count — the correct number was "
-                        f"{expected}. Let's start again from 1! "
-                        f"(Previous streak: {streak})")
+                        embed=ui.warn("Wait your turn",
+                                      f"Hold on, you can't count twice in a row. Wait for "
+                                      f"someone else to count next. The next number is still "
+                                      f"{expected}."))
+                except Exception:
+                    pass
+            elif number != expected:
+                try:
+                    await message.channel.send(
+                        embed=ui.warn("Count reset",
+                                      f"Oops, {number} breaks the count. The correct number was "
+                                      f"{expected}. Let's start again from 1! "
+                                      f"(Previous streak: {streak})"))
                 except Exception:
                     pass
         except Exception:

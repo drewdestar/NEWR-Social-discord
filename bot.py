@@ -11,9 +11,12 @@ guild-synced to NEWR LABS only. There is NO prefix command, NO
 command_prefix, and NO feature that requires typing a prefix: the bot
 is created with command_prefix=None and no @commands.command is
 defined anywhere. The only non-command behaviour is passive and
-automatic: starboard reaction tracking (on_raw_reaction_add),
-the counting game (on_message in the configured channel only), and
-the daily birthday check at 00:05 WIB. None of those can be invoked
+automatic: starboard reaction tracking (on_raw_reaction_add and
+on_raw_reaction_remove, including live board-post edits/removals),
+the counting game (on_message in the configured channel only,
+including the no-counting-twice-in-a-row rule), and
+the daily birthday check at 00:05 WIB (including birthday-role
+sync when a role is configured). None of those can be invoked
 as a command by a user.
 """
 from __future__ import annotations
@@ -91,6 +94,7 @@ class SocialBot(commands.Bot):
             return
         self._synced = True
         guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)
         print(f"Synced {len(synced)} slash commands to guild {GUILD_ID}")
 
